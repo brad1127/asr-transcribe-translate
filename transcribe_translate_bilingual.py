@@ -139,6 +139,11 @@ def main() -> None:
     # Phase 2: free Whisper's compute work before loading Hy-MT2 for translation.
     del whisper
     print("Loading Hy-MT2 Q4_K_M...", flush=True)
+    server_env = os.environ.copy()
+    server_env["LD_LIBRARY_PATH"] = (
+        f"{llama_server.parent}:"
+        f"{server_env.get('LD_LIBRARY_PATH', '')}"
+    )
     server = subprocess.Popen(
         [
             str(llama_server), "--model", str(translation_model),
@@ -147,6 +152,7 @@ def main() -> None:
             "--n-gpu-layers", "0",
         ],
         cwd=str(llama_server.parent),
+        env=server_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

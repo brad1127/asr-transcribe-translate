@@ -9,11 +9,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(errors="replace")
-
 
 ROOT = Path(__file__).resolve().parent
 LOCAL_DEPS = ROOT / ".deps"
@@ -92,7 +90,8 @@ def main() -> None:
     parser.add_argument("--translation-model", default=str(ROOT / "models" / "Hy-MT2-1.8B-GGUF" / "Hy-MT2-1.8B-Q4_K_M.gguf"))
     parser.add_argument("--llama-server", default=str(ROOT / "llama_cpp" / "llama-server.exe"))
     parser.add_argument("--server-url", default="http://127.0.0.1:8765")
-    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--threads", type=int, default=2, help="Hy-MT2 translation CPU threads")
+    parser.add_argument("--whisper-threads", type=int, default=2, help="Whisper CPU threads")
     parser.add_argument("--language", default="en")
     args = parser.parse_args()
 
@@ -101,11 +100,45 @@ def main() -> None:
     whisper_model = Path(args.whisper_model).resolve()
     translation_model = Path(args.translation_model).resolve()
     llama_server = Path(args.llama_server).resolve()
-    for path, label in [(input_path, "Input video"), (whisper_model, "Whisper model"), (translation_model, "Translation model"), (llama_server, "llama-server")]:
+    for path, label in [
+        (input_path, "Input video"),
+        (whisper_model, "Whisper model"),
+        (translation_model, "Translation model"),
+        (llama_server, "llama-server"),
+    ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Phase 1: Whisper has exclusive use of CPU resources.
+    print("Transcribing English with Whisper...", flush=True)
+    whisper = WhisperModel(
+        str(whisper_model),
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=args.whisper_threads,
+    )
+    segments, info = whisper.transcribe(
+        str(input_path),
+        language=args.language,
+        task="transcribe",
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+    )
+    rows = [
+        {"start": float(s.start), "end": float(s.end), "en": s.text.strip()}
+        for s in segments if s.text.strip()
+    ]
+    write_srt(
+        output_dir / f"{input_path.stem}.en.srt",
+        [{**row, "text": row["en"]} for row in rows],
+    )
+    print(f"Whisper produced {len(rows)} segments; language={info.language}", flush=True)
+
+    # Phase 2: free Whisper's compute work before loading Hy-MT2 for translation.
+    del whisper
+    print("Loading Hy-MT2 Q4_K_M...", flush=True)
     server = subprocess.Popen(
         [
             str(llama_server), "--model", str(translation_model),
@@ -120,22 +153,7 @@ def main() -> None:
     )
 
     try:
-        print("Loading Hy-MT2 Q4_K_M...", flush=True)
         wait_for_server(args.server_url, server)
-        print("Transcribing English with Whisper...", flush=True)
-        whisper = WhisperModel(str(whisper_model), device="cpu", compute_type="int8", cpu_threads=2)
-        segments, info = whisper.transcribe(
-            str(input_path), language=args.language, task="transcribe",
-            beam_size=5, vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-        )
-        rows = [
-            {"start": float(s.start), "end": float(s.end), "en": s.text.strip()}
-            for s in segments if s.text.strip()
-        ]
-        write_srt(output_dir / f"{input_path.stem}.en.srt", [{**r, "text": r["en"]} for r in rows])
-        print(f"Whisper produced {len(rows)} segments; language={info.language}", flush=True)
-
         translated = []
         for index, row in enumerate(rows, 1):
             for attempt in range(3):
@@ -151,7 +169,7 @@ def main() -> None:
             print(f"Translated {index}/{len(rows)}", flush=True)
 
         base = output_dir / input_path.stem
-        write_srt(output_dir / f"{input_path.stem}.zh.srt", [{**r, "text": r["zh"]} for r in translated])
+        write_srt(output_dir / f"{input_path.stem}.zh.srt", [{**row, "text": row["zh"]} for row in translated])
         write_srt(output_dir / f"{input_path.stem}.bilingual.srt", translated, bilingual=True)
         (output_dir / f"{input_path.stem}.segments.json").write_text(
             json.dumps({"input": str(input_path), "source_language": "English", "target_language": "Simplified Chinese", "segments": translated}, ensure_ascii=False, indent=2),
